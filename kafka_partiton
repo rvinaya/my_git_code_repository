@@ -1,0 +1,64 @@
+import sys
+from pyspark import SparkConf
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, from_json, lit
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+
+from lib.logger import Log4j
+
+if __name__ == "__main__":
+    conf = SparkConf() \
+        .setMaster("local[3]") \
+        .setAppName("KafkaToHiveBatch")
+
+    spark = SparkSession.builder.config(conf=conf).enableHiveSupport().getOrCreate()
+    sc = spark.sparkContext
+    logger = Log4j(spark)
+
+    if len(sys.argv) != 4:
+        logger.error("Usage: KafkaToHiveBatch <bootstrap-servers> <subscribe-type> <hive-table>")
+        sys.exit(-1)
+
+    bootstrap_servers = sys.argv[1]
+    subscribe_type = sys.argv[2]
+    hive_table = sys.argv[3]
+
+    # Define the schema for the incoming data
+    schema = StructType([
+        StructField("Age", IntegerType(), True),
+        StructField("Gender", StringType(), True),
+        StructField("Country", StringType(), True),
+        StructField("State", StringType(), True)
+    ])
+
+    # Read data from Kafka
+    kafkaDF = spark \
+        .read \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", bootstrap_servers) \
+        .option("subscribe", subscribe_type) \
+        .load()
+
+    # Convert the value column from Kafka (which is in binary) to string
+    valueDF = kafkaDF.selectExpr("CAST(value AS STRING)")
+
+    # Parse the JSON data and apply the schema
+    surveyDF = valueDF.select(from_json(col("value"), schema).alias("data")).select("data.*")
+
+    # Add a new default column
+    surveyDF = surveyDF.withColumn("NewColumn", lit("DefaultString"))
+
+    # Define a function to process each partition and write to Hive
+    def process_partition(partition):
+        partition_list = list(partition)
+        if partition_list:
+            partition_df = spark.createDataFrame(partition_list, schema=schema.add("NewColumn", StringType()))
+            partition_df.write \
+                .mode("append") \
+                .format("hive") \
+                .saveAsTable(hive_table)
+
+    # Apply the function to each partition
+    surveyDF.foreachPartition(process_partition)
+
+    logger.info(f"Data written to Hive table {hive_table}")
